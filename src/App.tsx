@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import { supabase } from "./lib/supabase";
 
 type Mode = "terrain" | "bureau";
@@ -23,7 +23,11 @@ type Expense = {
   projectId: string;
   supplier: string;
   category: string;
-  amount: number;
+  amount: number;        // TTC
+  amountHt?: number;     // HT réel
+  vatAmount?: number;    // TVA réelle
+  expenseDate?: string;  // AAAA-MM-JJ
+  documentId?: string;   // lien vers le document source
   note?: string;
 };
 
@@ -44,6 +48,16 @@ type DocumentItem = {
   status: "À analyser" | "Analysé";
   storagePath: string;
   note?: string;
+  // Champs extraits par l'IA
+  supplierName?: string | null;
+  date?: string | null;
+  amountHt?: number | null;
+  amountTtc?: number | null;
+  vatAmount?: number | null;
+  vatRate?: number | null;
+  hasVat?: boolean | null;
+  confidence?: number | null;
+  notes?: string | null;
 };
 
 type SupabaseProjectRow = {
@@ -70,9 +84,40 @@ type SupabaseDocumentRow = {
   size_bytes: number | null;
   status: string;
   storage_path: string;
+  extracted_supplier_name?: string | null;
+  extracted_date?: string | null;
+  extracted_amount_ht?: number | null;
+  extracted_amount_ttc?: number | null;
+  extracted_vat_amount?: number | null;
+  extracted_vat_rate?: number | null;
+  has_vat?: boolean | null;
+  extraction_confidence?: number | null;
+  extraction_notes?: string | null;
 };
 
 const DOCUMENTS_BUCKET = "hub-artisans-documents";
+
+const DOCUMENT_COLUMNS =
+  "id, project_id, file_name, mime_type, size_bytes, status, storage_path, extracted_supplier_name, extracted_date, extracted_amount_ht, extracted_amount_ttc, extracted_vat_amount, extracted_vat_rate, has_vat, extraction_confidence, extraction_notes";
+
+type ExpensePrefill = {
+  projectId?: string;
+  supplier?: string;
+  amountTtc?: number | null;
+  amountHt?: number | null;
+  vatAmount?: number | null;
+  expenseDate?: string | null;
+  documentId?: string;
+};
+
+type CaptureValues = {
+  projectId: string;
+  supplier: string;
+  amountTtc: number;
+  amountHt?: number;
+  vatAmount?: number;
+  category: string;
+};
 
 const initialExpenses: Expense[] = [
   { id: "e1", projectId: "31111111-1111-4111-8111-111111111111", supplier: "Alu Bretagne Distribution", category: "Matériaux", amount: 3360 },
@@ -86,12 +131,8 @@ const initialTimeEntries: TimeEntry[] = [
   { id: "t3", projectId: "32222222-2222-4222-8222-222222222222", label: "Préparation chantier portail", hours: 5, hourlyRate: 45 },
 ];
 
-const initialDocuments: DocumentItem[] = [
-  { id: "d1", projectId: "31111111-1111-4111-8111-111111111111", fileName: "facture-alu-bretagne.pdf", fileType: "application/pdf", fileSize: 245000, status: "À analyser", storagePath: "demo/facture-alu-bretagne.pdf", note: "Facture fournisseur à rapprocher" },
-];
-
 function euros(value: number) {
-  return new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR", maximumFractionDigits: 0 }).format(value || 0);
+  return new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR", maximumFractionDigits: 2 }).format(value || 0);
 }
 
 function fileSize(value: number) {
@@ -110,7 +151,6 @@ function statusLabel(status: string) {
   };
   return labels[status] || status;
 }
-
 
 function expenseCategoryToSupabase(category: string) {
   const map: Record<string, string> = {
@@ -156,6 +196,15 @@ function mapDocument(row: SupabaseDocumentRow): DocumentItem {
     fileSize: row.size_bytes || 0,
     status: row.status === "processed" || row.status === "analysed" || row.status === "analyzed" ? "Analysé" : "À analyser",
     storagePath: row.storage_path,
+    supplierName: row.extracted_supplier_name ?? null,
+    date: row.extracted_date ?? null,
+    amountHt: row.extracted_amount_ht ?? null,
+    amountTtc: row.extracted_amount_ttc ?? null,
+    vatAmount: row.extracted_vat_amount ?? null,
+    vatRate: row.extracted_vat_rate ?? null,
+    hasVat: row.has_vat ?? null,
+    confidence: row.extraction_confidence ?? null,
+    notes: row.extraction_notes ?? null,
   };
 }
 
@@ -163,7 +212,7 @@ function cleanFileName(name: string) {
   const fallback = "document";
   const safe = (name || fallback)
     .normalize("NFD")
-    .replace(/[̀-ͯ]/g, "")
+    .replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-zA-Z0-9._-]+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "")
@@ -185,6 +234,21 @@ function supabaseErrorDetails(error: any) {
   return parts.join(" · ") || JSON.stringify(error);
 }
 
+// Extrait un message d'erreur lisible d'un appel functions.invoke
+async function invokeErrorMessage(error: any): Promise<string> {
+  let detail = error?.message || "Erreur inconnue.";
+  try {
+    const ctx = error?.context;
+    if (ctx && typeof ctx.json === "function") {
+      const body = await ctx.json();
+      if (body?.error) detail = body.error;
+    }
+  } catch {
+    // on garde le message générique
+  }
+  return detail;
+}
+
 function realCost(project: Project) {
   return project.expenses + project.laborCost;
 }
@@ -197,8 +261,56 @@ function marginRate(project: Project) {
   return project.revenue > 0 ? (margin(project) / project.revenue) * 100 : 0;
 }
 
+function eurosRounded(value: number) {
+  return new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR", maximumFractionDigits: 0 }).format(value || 0);
+}
+
 function Badge({ status }: { status: string }) {
   return <span className={`badge badge-${status}`}>{statusLabel(status)}</span>;
+}
+
+function DocExtract({ d }: { d: DocumentItem }) {
+  return (
+    <div className="ai-extract">
+      <div><span>Fournisseur</span><strong>{d.supplierName || "—"}</strong></div>
+      <div><span>Date</span><strong>{d.date || "—"}</strong></div>
+      <div><span>HT</span><strong>{d.amountHt != null ? euros(d.amountHt) : "—"}</strong></div>
+      <div><span>TVA</span><strong>{d.hasVat === false ? "Sans TVA" : d.vatAmount != null ? euros(d.vatAmount) : "—"}{d.vatRate != null && d.hasVat !== false ? ` (${d.vatRate}%)` : ""}</strong></div>
+      <div><span>TTC</span><strong>{d.amountTtc != null ? euros(d.amountTtc) : "—"}</strong></div>
+    </div>
+  );
+}
+
+function DocItem({ d, projectName, analyzing, analyzeDocument, openExpenseFromDoc, openStoredDocument }: {
+  d: DocumentItem;
+  projectName: string;
+  analyzing: boolean;
+  analyzeDocument: (d: DocumentItem) => void;
+  openExpenseFromDoc: (d: DocumentItem) => void;
+  openStoredDocument: (d: DocumentItem) => Promise<void>;
+}) {
+  return (
+    <div className="doc-item">
+      <div>
+        <strong>{d.fileName}</strong>
+        <span>{projectName} · {fileSize(d.fileSize)}</span>
+        <small>{d.storagePath}</small>
+        {d.status === "Analysé" && <DocExtract d={d} />}
+        {d.notes && <em>{d.notes}</em>}
+        {d.note && <em>{d.note}</em>}
+      </div>
+      <div className="doc-actions">
+        <span className="doc-status">{d.status}</span>
+        <button type="button" className="open-doc" disabled={analyzing} onClick={() => analyzeDocument(d)}>
+          {analyzing ? "Analyse..." : d.status === "Analysé" ? "Ré-analyser" : "Analyser IA"}
+        </button>
+        {d.status === "Analysé" && (
+          <button type="button" className="open-doc doc-cta" onClick={() => openExpenseFromDoc(d)}>→ Dépense</button>
+        )}
+        <button type="button" className="open-doc" onClick={() => openStoredDocument(d)}>Ouvrir</button>
+      </div>
+    </div>
+  );
 }
 
 function Login({ loading, error, onLogin }: { loading: boolean; error: string; onLogin: () => void }) {
@@ -218,7 +330,7 @@ function Login({ loading, error, onLogin }: { loading: boolean; error: string; o
 
 function Sidebar({ mode, page, setPage }: { mode: Mode; page: string; setPage: (page: string) => void }) {
   const items = mode === "terrain"
-    ? ["Terrain", "Chantiers", "Dépenses", "Temps passé", "Documents IA"]
+    ? ["Terrain", "Chantiers", "Temps passé", "Documents IA"]
     : ["Dashboard", "Chantiers", "Clients", "Devis", "Dépenses", "Temps passé", "Factures", "Paiements", "Documents IA", "Réglages"];
 
   return (
@@ -237,13 +349,20 @@ function Stat({ title, value, helper }: { title: string; value: string; helper?:
   return <div className="stat"><p>{title}</p><strong>{value}</strong>{helper && <span>{helper}</span>}</div>;
 }
 
-function FieldPage({ projects, docs, openProject, openExpense, openTime, openDoc }: { projects: Project[]; docs: DocumentItem[]; openProject: (p: Project) => void; openExpense: () => void; openTime: () => void; openDoc: () => void }) {
+function FieldPage({ projects, docs, openProject, onCapture, openTime, openExpense }: { projects: Project[]; docs: DocumentItem[]; openProject: (p: Project) => void; onCapture: () => void; openTime: () => void; openExpense: () => void }) {
   const active = projects.filter((p) => ["in_progress", "accepted", "preparation", "to_quote"].includes(p.status));
   const alerts = active.filter((p) => marginRate(p) < 20).length + docs.filter((d) => d.status === "À analyser").length;
 
   return <main className="content field-content">
-    <section className="hero"><div><span>Mode terrain · Supabase</span><h1>Mes chantiers</h1><p>Les chantiers sont chargés depuis Supabase.</p></div><div className="alert-count"><strong>{alerts}</strong><span>alerte(s)</span></div></section>
-    <section className="quick"><button onClick={openExpense}>+ Dépense</button><button onClick={openTime}>+ Temps</button><button onClick={openDoc}>📷 Facture</button></section>
+    <section className="hero"><div><span>Mode terrain · Supabase</span><h1>Mes chantiers</h1><p>Photographie une facture, le reste se fait tout seul.</p></div><div className="alert-count"><strong>{alerts}</strong><span>alerte(s)</span></div></section>
+    <section className="capture-cta">
+      <button className="capture-btn" onClick={onCapture}>
+        <span className="cam">📷</span>
+        <span>Photographier une facture</span>
+        <small>Lecture automatique : fournisseur, date, montants</small>
+      </button>
+    </section>
+    <section className="quick small"><button onClick={openTime}>+ Temps passé</button><button onClick={openExpense}>+ Dépense manuelle</button></section>
     <section className="cards">
       {active.map((p) => {
         const rate = marginRate(p);
@@ -267,27 +386,40 @@ function Dashboard({ projects, docs, openProject, refresh }: { projects: Project
 
   return <main className="content">
     <div className="page-header"><div><h1>Tableau de bord bureau</h1><p>Données chantiers lues depuis Supabase.</p></div><button className="primary" onClick={refresh}>Rafraîchir Supabase</button></div>
-    <section className="stats"><Stat title="Chantiers" value={String(projects.length)} helper="Depuis Supabase" /><Stat title="CA prévu" value={euros(totalRevenue)} /><Stat title="Coût réel" value={euros(totalCost)} /><Stat title="Marge moyenne" value={`${average.toFixed(1)} %`} /></section>
+    <section className="stats"><Stat title="Chantiers" value={String(projects.length)} helper="Depuis Supabase" /><Stat title="CA prévu" value={eurosRounded(totalRevenue)} /><Stat title="Coût réel" value={eurosRounded(totalCost)} /><Stat title="Marge moyenne" value={`${average.toFixed(1)} %`} /></section>
     <section className="columns"><div className="panel"><h2>À traiter</h2><div className="todo warning"><strong>{low.length} chantier(s) en alerte marge</strong><span>À vérifier.</span></div><div className="todo"><strong>{docs.filter(d => d.status === "À analyser").length} document(s) à analyser</strong><span>Documents à traiter dans Supabase.</span></div></div><div className="panel"><h2>Alertes marge</h2>{low.length === 0 ? <p className="empty">Aucune alerte.</p> : low.map((p) => <div className="alert" key={p.id}><strong>{p.name}</strong><span>{marginRate(p).toFixed(1)} %</span></div>)}</div></section>
-    <section className="panel"><h2>Rentabilité des chantiers</h2><div className="table"><div className="row head"><span>Chantier</span><span>Client</span><span>Statut</span><span>CA</span><span>Coût</span><span>Marge</span><span>Taux</span></div>{projects.map((p) => <button key={p.id} className="row clickable" onClick={() => openProject(p)}><span>{p.name}</span><span>{p.client}</span><span><Badge status={p.status} /></span><span>{euros(p.revenue)}</span><span>{euros(realCost(p))}</span><span>{euros(margin(p))}</span><span className={marginRate(p) < 20 ? "danger-text" : "success-text"}>{marginRate(p).toFixed(1)} %</span></button>)}</div></section>
+    <section className="panel"><h2>Rentabilité des chantiers</h2><div className="table"><div className="row head"><span>Chantier</span><span>Client</span><span>Statut</span><span>CA</span><span>Coût</span><span>Marge</span><span>Taux</span></div>{projects.map((p) => <button key={p.id} className="row clickable" onClick={() => openProject(p)}><span>{p.name}</span><span>{p.client}</span><span><Badge status={p.status} /></span><span>{eurosRounded(p.revenue)}</span><span>{eurosRounded(realCost(p))}</span><span>{eurosRounded(margin(p))}</span><span className={marginRate(p) < 20 ? "danger-text" : "success-text"}>{marginRate(p).toFixed(1)} %</span></button>)}</div></section>
   </main>;
 }
 
 function ProjectsPage({ projects, openProject }: { projects: Project[]; openProject: (p: Project) => void }) {
   const [search, setSearch] = useState("");
   const filtered = projects.filter((p) => `${p.name} ${p.client} ${p.city}`.toLowerCase().includes(search.toLowerCase()));
-  return <main className="content"><div className="page-header"><div><h1>Chantiers</h1><p>Liste chargée depuis Supabase.</p></div><button className="primary">+ Nouveau chantier</button></div><input className="search" placeholder="Rechercher..." value={search} onChange={(e) => setSearch(e.target.value)} /><section className="grid">{filtered.map((p) => <button key={p.id} className="project-card" onClick={() => openProject(p)}><div className="card-head"><div><h2>{p.name}</h2><p>{p.client} — {p.city}</p></div><Badge status={p.status} /></div><div className="numbers"><div><span>CA</span><strong>{euros(p.revenue)}</strong></div><div><span>Coût</span><strong>{euros(realCost(p))}</strong></div><div><span>Marge</span><strong>{euros(margin(p))}</strong></div></div><div className="margin-line"><span>Taux de marge</span><strong className={marginRate(p) < 20 ? "danger-text" : "success-text"}>{marginRate(p).toFixed(1)} %</strong></div></button>)}</section></main>;
+  return <main className="content"><div className="page-header"><div><h1>Chantiers</h1><p>Liste chargée depuis Supabase.</p></div><button className="primary">+ Nouveau chantier</button></div><input className="search" placeholder="Rechercher..." value={search} onChange={(e) => setSearch(e.target.value)} /><section className="grid">{filtered.map((p) => <button key={p.id} className="project-card" onClick={() => openProject(p)}><div className="card-head"><div><h2>{p.name}</h2><p>{p.client} — {p.city}</p></div><Badge status={p.status} /></div><div className="numbers"><div><span>CA</span><strong>{eurosRounded(p.revenue)}</strong></div><div><span>Coût</span><strong>{eurosRounded(realCost(p))}</strong></div><div><span>Marge</span><strong>{eurosRounded(margin(p))}</strong></div></div><div className="margin-line"><span>Taux de marge</span><strong className={marginRate(p) < 20 ? "danger-text" : "success-text"}>{marginRate(p).toFixed(1)} %</strong></div></button>)}</section></main>;
 }
 
-function ExpenseForm({ projects, defaultProjectId, cancel, save }: { projects: Project[]; defaultProjectId?: string; cancel: () => void; save: (e: Expense) => Promise<void> }) {
-  const [projectId, setProjectId] = useState(defaultProjectId || projects[0]?.id || "");
-  const [supplier, setSupplier] = useState("");
+function ExpenseForm({ projects, defaultProjectId, prefill, cancel, save }: { projects: Project[]; defaultProjectId?: string; prefill?: ExpensePrefill; cancel: () => void; save: (e: Expense) => Promise<void> }) {
+  const [projectId, setProjectId] = useState(prefill?.projectId || defaultProjectId || projects[0]?.id || "");
+  const [supplier, setSupplier] = useState(prefill?.supplier || "");
   const [category, setCategory] = useState("Matériaux");
-  const [amount, setAmount] = useState("");
+  const [amount, setAmount] = useState(prefill?.amountTtc != null ? String(prefill.amountTtc) : "");
+  const [amountHt, setAmountHt] = useState(prefill?.amountHt != null ? String(prefill.amountHt) : "");
+  const [vatAmount, setVatAmount] = useState(prefill?.vatAmount != null ? String(prefill.vatAmount) : "");
   const [note, setNote] = useState("");
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
   const project = projects.find((p) => p.id === projectId);
+  const fromDoc = Boolean(prefill?.documentId);
+
+  function applyVatRate(rate: number) {
+    const ttc = Number(amount.replace(",", ".")) || 0;
+    if (!ttc) { setError("Renseigne d’abord le montant TTC."); return; }
+    setError("");
+    if (rate === 0) { setAmountHt(ttc.toFixed(2)); setVatAmount("0"); return; }
+    const ht = ttc / (1 + rate / 100);
+    setAmountHt(ht.toFixed(2));
+    setVatAmount((ttc - ht).toFixed(2));
+  }
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -298,6 +430,9 @@ function ExpenseForm({ projects, defaultProjectId, cancel, save }: { projects: P
     if (!supplier.trim()) return setError("Indique le fournisseur.");
     if (!parsed || parsed <= 0) return setError("Indique un montant valide.");
 
+    const parsedHt = amountHt.trim() ? Number(amountHt.replace(",", ".")) : null;
+    const parsedVat = vatAmount.trim() ? Number(vatAmount.replace(",", ".")) : null;
+
     setSaving(true);
     try {
       await save({
@@ -306,6 +441,10 @@ function ExpenseForm({ projects, defaultProjectId, cancel, save }: { projects: P
         supplier: supplier.trim(),
         category,
         amount: parsed,
+        amountHt: parsedHt ?? undefined,
+        vatAmount: parsedVat ?? undefined,
+        expenseDate: prefill?.expenseDate || undefined,
+        documentId: prefill?.documentId,
         note: note.trim() || undefined,
       });
     } catch (err) {
@@ -315,7 +454,7 @@ function ExpenseForm({ projects, defaultProjectId, cancel, save }: { projects: P
     }
   }
 
-  return <main className="content field-content"><button className="back" onClick={cancel}>← Retour</button><div className="page-header"><div><h1>Ajouter une dépense</h1><p>Cette dépense sera enregistrée dans Supabase puis les chantiers seront rafraîchis.</p></div></div><form className="form" onSubmit={submit}>{error && <div className="error">{error}</div>}<label>Chantier<select value={projectId} onChange={(e) => setProjectId(e.target.value)}>{projects.map((p) => <option key={p.id} value={p.id}>{p.name} — {p.client}</option>)}</select></label>{project && <div className="summary"><strong>{project.name}</strong><span>Dépenses : {euros(project.expenses)} · Marge : {marginRate(project).toFixed(0)} %</span></div>}<label>Fournisseur<input value={supplier} onChange={(e) => setSupplier(e.target.value)} placeholder="Ex : Point.P" /></label><label>Catégorie<select value={category} onChange={(e) => setCategory(e.target.value)}><option>Matériaux</option><option>Location matériel</option><option>Carburant / déplacement</option><option>Sous-traitance</option><option>Outillage</option><option>Consommables</option><option>Autre</option></select></label><label>Montant TTC<input inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="Ex : 246,80" /></label><label>Note facultative<textarea value={note} onChange={(e) => setNote(e.target.value)} /></label><div className="info"><strong>Écriture Supabase</strong><span>V1 : le montant TTC est enregistré, HT et TVA restent à 0 pour garder la saisie terrain simple.</span></div><div className="actions right"><button type="button" className="secondary" onClick={cancel} disabled={saving}>Annuler</button><button type="submit" className="primary" disabled={saving}>{saving ? "Enregistrement..." : "Enregistrer dans Supabase"}</button></div></form></main>;
+  return <main className="content field-content"><button className="back" onClick={cancel}>← Retour</button><div className="page-header"><div><h1>Ajouter une dépense</h1><p>Cette dépense sera enregistrée dans Supabase puis les chantiers seront rafraîchis.</p></div></div><form className="form" onSubmit={submit}>{error && <div className="error">{error}</div>}{fromDoc && <div className="info"><strong>Pré-rempli depuis la lecture IA</strong><span>Vérifie les montants extraits avant d’enregistrer. La dépense sera reliée au document d’origine.</span></div>}<label>Chantier<select value={projectId} onChange={(e) => setProjectId(e.target.value)}>{projects.map((p) => <option key={p.id} value={p.id}>{p.name} — {p.client}</option>)}</select></label>{project && <div className="summary"><strong>{project.name}</strong><span>Dépenses : {euros(project.expenses)} · Marge : {marginRate(project).toFixed(0)} %</span></div>}<label>Fournisseur<input value={supplier} onChange={(e) => setSupplier(e.target.value)} placeholder="Ex : Point.P" /></label><label>Catégorie<select value={category} onChange={(e) => setCategory(e.target.value)}><option>Matériaux</option><option>Location matériel</option><option>Carburant / déplacement</option><option>Sous-traitance</option><option>Outillage</option><option>Consommables</option><option>Autre</option></select></label><label>Montant TTC<input inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="Ex : 246,80" /></label><div className="vat-tools"><span>Calcul auto HT / TVA :</span><button type="button" onClick={() => applyVatRate(20)}>20 %</button><button type="button" onClick={() => applyVatRate(10)}>10 %</button><button type="button" onClick={() => applyVatRate(5.5)}>5,5 %</button><button type="button" onClick={() => applyVatRate(0)}>Sans TVA</button></div><div className="two-cols"><label>Montant HT<input inputMode="decimal" value={amountHt} onChange={(e) => setAmountHt(e.target.value)} placeholder="Ex : 205,67" /></label><label>Montant TVA<input inputMode="decimal" value={vatAmount} onChange={(e) => setVatAmount(e.target.value)} placeholder="Ex : 41,13" /></label></div><label>Note facultative<textarea value={note} onChange={(e) => setNote(e.target.value)} /></label><div className="info"><strong>Écriture Supabase</strong><span>Le TTC, le HT et la TVA sont enregistrés dans la table expenses. Laissés vides, HT et TVA valent 0.</span></div><div className="actions right"><button type="button" className="secondary" onClick={cancel} disabled={saving}>Annuler</button><button type="submit" className="primary" disabled={saving}>{saving ? "Enregistrement..." : "Enregistrer dans Supabase"}</button></div></form></main>;
 }
 
 function TimeForm({ projects, defaultProjectId, cancel, save }: { projects: Project[]; defaultProjectId?: string; cancel: () => void; save: (t: TimeEntry) => Promise<void> }) {
@@ -373,24 +512,113 @@ function DocumentForm({ projects, defaultProjectId, cancel, save }: { projects: 
     }
   }
 
-  return <main className="content field-content"><button className="back" onClick={cancel} disabled={saving}>← Retour</button><div className="page-header"><div><h1>Photo facture / Document IA</h1><p>Photo terrain ou import PDF/image, envoyé dans Supabase Storage.</p></div></div><form className="form" onSubmit={submit}>{error && <div className="error">{error}</div>}<label>Chantier<select value={projectId} onChange={(e) => setProjectId(e.target.value)} disabled={saving}>{projects.map((p) => <option key={p.id} value={p.id}>{p.name} — {p.client}</option>)}</select></label>{project && <div className="summary"><strong>{project.name}</strong><span>Le fichier sera rangé dans Supabase Storage et rattaché à ce chantier.</span></div>}<label>📷 Prendre une photo ou joindre un fichier<input type="file" accept="image/*,.pdf" capture="environment" disabled={saving} onChange={(e) => setFile(e.target.files?.[0] || null)} /></label>{file && <div className="doc"><strong>{file.name}</strong><span>{file.type || "Fichier"} · {fileSize(file.size)}</span><em>Statut : à analyser</em></div>}<label>Note facultative<textarea value={note} onChange={(e) => setNote(e.target.value)} disabled={saving} placeholder="Ex : ticket de caisse, facture fournisseur, reçu par mail..." /></label><div className="info"><strong>Écriture Supabase</strong><span>Le fichier est envoyé dans le bucket privé hub-artisans-documents puis une ligne est créée dans la table documents.</span></div><div className="actions right"><button type="button" className="secondary" onClick={cancel} disabled={saving}>Annuler</button><button type="submit" className="primary" disabled={saving}>{saving ? "Envoi du document..." : "Envoyer dans Supabase"}</button></div></form></main>;
+  return <main className="content field-content"><button className="back" onClick={cancel} disabled={saving}>← Retour</button><div className="page-header"><div><h1>Importer un document</h1><p>Import PDF/image, envoyé dans Supabase Storage.</p></div></div><form className="form" onSubmit={submit}>{error && <div className="error">{error}</div>}<label>Chantier<select value={projectId} onChange={(e) => setProjectId(e.target.value)} disabled={saving}>{projects.map((p) => <option key={p.id} value={p.id}>{p.name} — {p.client}</option>)}</select></label>{project && <div className="summary"><strong>{project.name}</strong><span>Le fichier sera rangé dans Supabase Storage et rattaché à ce chantier.</span></div>}<label>Joindre un fichier<input type="file" accept="image/*,.pdf" disabled={saving} onChange={(e) => setFile(e.target.files?.[0] || null)} /></label>{file && <div className="doc"><strong>{file.name}</strong><span>{file.type || "Fichier"} · {fileSize(file.size)}</span><em>Statut : à analyser</em></div>}<label>Note facultative<textarea value={note} onChange={(e) => setNote(e.target.value)} disabled={saving} placeholder="Ex : ticket de caisse, facture fournisseur, reçu par mail..." /></label><div className="info"><strong>Écriture Supabase</strong><span>Le fichier est envoyé dans le bucket privé hub-artisans-documents puis une ligne est créée dans la table documents. Tu pourras ensuite lancer la lecture IA.</span></div><div className="actions right"><button type="button" className="secondary" onClick={cancel} disabled={saving}>Annuler</button><button type="submit" className="primary" disabled={saving}>{saving ? "Envoi du document..." : "Envoyer dans Supabase"}</button></div></form></main>;
 }
 
-function DocumentsPage({ projects, docs, openDoc, openStoredDocument }: { projects: Project[]; docs: DocumentItem[]; openDoc: () => void; openStoredDocument: (document: DocumentItem) => Promise<void> }) {
-  return <main className="content"><div className="page-header"><div><h1>Documents IA</h1><p>Documents enregistrés dans Supabase Storage et rattachés aux chantiers.</p></div><button className="primary" onClick={openDoc}>+ Document</button></div><section className="panel"><h2>Documents ajoutés</h2>{docs.length === 0 ? <p className="empty">Aucun document.</p> : <div className="doc-list">{docs.map((d) => { const p = projects.find((x) => x.id === d.projectId); return <div className="doc-item" key={d.id}><div><strong>{d.fileName}</strong><span>{p?.name || "Chantier inconnu"} · {fileSize(d.fileSize)}</span><small>{d.storagePath}</small>{d.note && <em>{d.note}</em>}</div><div className="doc-actions"><span className="doc-status">{d.status}</span><button type="button" className="open-doc" onClick={() => openStoredDocument(d)}>Ouvrir</button></div></div>; })}</div>}</section></main>;
+function DocumentsPage({ projects, docs, openDoc, openStoredDocument, analyzeDocument, analyzingId, openExpenseFromDoc, addLabel }: { projects: Project[]; docs: DocumentItem[]; openDoc: () => void; openStoredDocument: (document: DocumentItem) => Promise<void>; analyzeDocument: (d: DocumentItem) => void; analyzingId: string | null; openExpenseFromDoc: (d: DocumentItem) => void; addLabel: string }) {
+  return <main className="content"><div className="page-header"><div><h1>Documents IA</h1><p>Photographie un ticket ou une facture, lance la lecture IA, puis transforme-la en dépense en un clic.</p></div><button className="primary" onClick={openDoc}>{addLabel}</button></div><section className="panel"><h2>Documents ajoutés</h2>{docs.length === 0 ? <p className="empty">Aucun document.</p> : <div className="doc-list">{docs.map((d) => { const p = projects.find((x) => x.id === d.projectId); return <DocItem key={d.id} d={d} projectName={p?.name || "Chantier inconnu"} analyzing={analyzingId === d.id} analyzeDocument={analyzeDocument} openExpenseFromDoc={openExpenseFromDoc} openStoredDocument={openStoredDocument} />; })}</div>}</section></main>;
 }
 
-function ProjectDetail({ project, expenses, times, docs, back, openExpense, openTime, openDoc, openStoredDocument }: { project: Project; expenses: Expense[]; times: TimeEntry[]; docs: DocumentItem[]; back: () => void; openExpense: (id: string) => void; openTime: (id: string) => void; openDoc: (id: string) => void; openStoredDocument: (document: DocumentItem) => Promise<void> }) {
+function ProjectDetail({ project, expenses, times, docs, back, openExpense, openTime, openDoc, openStoredDocument, analyzeDocument, analyzingId, openExpenseFromDoc }: { project: Project; expenses: Expense[]; times: TimeEntry[]; docs: DocumentItem[]; back: () => void; openExpense: (id: string) => void; openTime: (id: string) => void; openDoc: (id: string) => void; openStoredDocument: (document: DocumentItem) => Promise<void>; analyzeDocument: (d: DocumentItem) => void; analyzingId: string | null; openExpenseFromDoc: (d: DocumentItem) => void }) {
   const projectExpenses = expenses.filter((e) => e.projectId === project.id);
   const projectTimes = times.filter((t) => t.projectId === project.id);
   const projectDocs = docs.filter((d) => d.projectId === project.id);
   const rate = marginRate(project);
 
-  return <main className="content"><button className="back" onClick={back}>← Retour</button><div className="page-header"><div><h1>{project.name}</h1><p>{project.client} — {project.city}</p></div><Badge status={project.status} /></div><section className="stats"><Stat title="Revenu chantier" value={euros(project.revenue)} /><Stat title="Dépenses" value={euros(project.expenses)} /><Stat title="Main-d’œuvre" value={euros(project.laborCost)} /><Stat title="Marge réelle" value={euros(margin(project))} helper={`${rate.toFixed(1)} % de marge`} /></section>{rate < 20 && <div className="big-alert"><strong>Attention : marge basse</strong><span>Ce chantier est sous le seuil minimum.</span></div>}<section className="columns"><div className="panel"><div className="panel-head"><h2>Dépenses liées</h2><button onClick={() => openExpense(project.id)}>+ Ajouter</button></div>{projectExpenses.length === 0 ? <p className="empty">Aucune dépense rattachée en local sur cette session.</p> : projectExpenses.map((e) => <div className="line" key={e.id}><div><strong>{e.supplier}</strong><span>{e.category}{e.note ? ` · ${e.note}` : ""}</span></div><strong>{euros(e.amount)}</strong></div>)}</div><div className="panel"><div className="panel-head"><h2>Temps passé</h2><button onClick={() => openTime(project.id)}>+ Ajouter</button></div>{projectTimes.length === 0 ? <p className="empty">Aucun temps local.</p> : projectTimes.map((t) => <div className="line" key={t.id}><div><strong>{t.label}</strong><span>{t.hours} h x {euros(t.hourlyRate)}</span></div><strong>{euros(t.hours * t.hourlyRate)}</strong></div>)}</div></section><section className="panel"><div className="panel-head"><h2>Documents chantier</h2><button onClick={() => openDoc(project.id)}>+ Document</button></div>{projectDocs.length === 0 ? <p className="empty">Aucun document rattaché.</p> : <div className="doc-list">{projectDocs.map((d) => <div className="doc-item" key={d.id}><div><strong>{d.fileName}</strong><span>{d.fileType} · {fileSize(d.fileSize)}</span><small>{d.storagePath}</small>{d.note && <em>{d.note}</em>}</div><div className="doc-actions"><span className="doc-status">{d.status}</span><button type="button" className="open-doc" onClick={() => openStoredDocument(d)}>Ouvrir</button></div></div>)}</div>}</section><section className="panel"><h2>Actions rapides</h2><div className="actions"><button onClick={() => openExpense(project.id)}>Ajouter une dépense</button><button onClick={() => openTime(project.id)}>Ajouter du temps</button><button onClick={() => openDoc(project.id)}>Joindre un document</button><button>Créer une facture</button></div></section></main>;
+  return <main className="content"><button className="back" onClick={back}>← Retour</button><div className="page-header"><div><h1>{project.name}</h1><p>{project.client} — {project.city}</p></div><Badge status={project.status} /></div><section className="stats"><Stat title="Revenu chantier" value={euros(project.revenue)} /><Stat title="Dépenses" value={euros(project.expenses)} /><Stat title="Main-d’œuvre" value={euros(project.laborCost)} /><Stat title="Marge réelle" value={euros(margin(project))} helper={`${rate.toFixed(1)} % de marge`} /></section>{rate < 20 && <div className="big-alert"><strong>Attention : marge basse</strong><span>Ce chantier est sous le seuil minimum.</span></div>}<section className="columns"><div className="panel"><div className="panel-head"><h2>Dépenses liées</h2><button onClick={() => openExpense(project.id)}>+ Ajouter</button></div>{projectExpenses.length === 0 ? <p className="empty">Aucune dépense rattachée en local sur cette session.</p> : projectExpenses.map((e) => <div className="line" key={e.id}><div><strong>{e.supplier}</strong><span>{e.category}{e.note ? ` · ${e.note}` : ""}</span></div><strong>{euros(e.amount)}</strong></div>)}</div><div className="panel"><div className="panel-head"><h2>Temps passé</h2><button onClick={() => openTime(project.id)}>+ Ajouter</button></div>{projectTimes.length === 0 ? <p className="empty">Aucun temps local.</p> : projectTimes.map((t) => <div className="line" key={t.id}><div><strong>{t.label}</strong><span>{t.hours} h x {euros(t.hourlyRate)}</span></div><strong>{euros(t.hours * t.hourlyRate)}</strong></div>)}</div></section><section className="panel"><div className="panel-head"><h2>Documents chantier</h2><button onClick={() => openDoc(project.id)}>+ Document</button></div>{projectDocs.length === 0 ? <p className="empty">Aucun document rattaché.</p> : <div className="doc-list">{projectDocs.map((d) => <DocItem key={d.id} d={d} projectName={project.name} analyzing={analyzingId === d.id} analyzeDocument={analyzeDocument} openExpenseFromDoc={openExpenseFromDoc} openStoredDocument={openStoredDocument} />)}</div>}</section><section className="panel"><h2>Actions rapides</h2><div className="actions"><button onClick={() => openExpense(project.id)}>Ajouter une dépense</button><button onClick={() => openTime(project.id)}>Ajouter du temps</button><button onClick={() => openDoc(project.id)}>Joindre un document</button><button>Créer une facture</button></div></section></main>;
 }
 
 function Placeholder({ title }: { title: string }) {
   return <main className="content"><div className="page-header"><div><h1>{title}</h1><p>Module en préparation.</p></div></div><div className="panel"><h2>À venir</h2><p className="empty">Les chantiers sont connectés à Supabase. Les écritures seront branchées étape par étape.</p></div></main>;
+}
+
+// --- Flux terrain : revue d'une facture lue par l'IA ---
+function CaptureReview({ doc, projects, defaultProjectId, validating, error, onValidate, onRetake }: { doc: DocumentItem; projects: Project[]; defaultProjectId: string; validating: boolean; error: string; onValidate: (v: CaptureValues) => void; onRetake: () => void }) {
+  const noTtc = doc.amountTtc == null;
+  const [projectId, setProjectId] = useState(doc.projectId || defaultProjectId || projects[0]?.id || "");
+  const [supplier, setSupplier] = useState(doc.supplierName || "");
+  const [ttc, setTtc] = useState(doc.amountTtc != null ? String(doc.amountTtc) : "");
+  const [ht, setHt] = useState(doc.amountHt != null ? String(doc.amountHt) : "");
+  const [tva, setTva] = useState(doc.vatAmount != null ? String(doc.vatAmount) : "");
+  const [category, setCategory] = useState("Matériaux");
+  const [showCorrect, setShowCorrect] = useState(noTtc || !doc.supplierName);
+  const [localErr, setLocalErr] = useState("");
+
+  const lowConfidence = doc.confidence != null && doc.confidence < 0.6;
+  const ttcNum = Number(ttc.replace(",", ".")) || 0;
+
+  function submit() {
+    if (!projectId) { setLocalErr("Choisis un chantier."); return; }
+    if (!supplier.trim()) { setLocalErr("Indique le fournisseur."); setShowCorrect(true); return; }
+    if (!ttcNum || ttcNum <= 0) { setLocalErr("Indique le montant TTC."); setShowCorrect(true); return; }
+    setLocalErr("");
+    onValidate({
+      projectId,
+      supplier: supplier.trim(),
+      amountTtc: ttcNum,
+      amountHt: ht.trim() ? Number(ht.replace(",", ".")) : undefined,
+      vatAmount: tva.trim() ? Number(tva.replace(",", ".")) : (doc.hasVat === false ? 0 : undefined),
+      category,
+    });
+  }
+
+  return (
+    <>
+      <div className="cap-amount">{ttcNum > 0 ? euros(ttcNum) : "Montant à saisir"}</div>
+      <div className="cap-supplier">{supplier || "Fournisseur à compléter"}</div>
+      <div className="cap-meta">{doc.date || "Date ?"}{" · "}{doc.hasVat === false ? <span className="cap-novat">Sans TVA</span> : tva.trim() ? `TVA ${euros(Number(tva.replace(",", ".")))}` : "TVA ?"}</div>
+
+      {lowConfidence && <div className="cap-warn">Lecture incertaine — vérifie les montants avant de valider.</div>}
+      {(localErr || error) && <div className="cap-warn cap-err-banner">{localErr || error}</div>}
+
+      <label className="cap-field">Chantier
+        <select value={projectId} onChange={(e) => setProjectId(e.target.value)}>
+          {projects.map((p) => <option key={p.id} value={p.id}>{p.name} — {p.client}</option>)}
+        </select>
+      </label>
+
+      {showCorrect && (
+        <div className="cap-correct">
+          <label>Fournisseur<input value={supplier} onChange={(e) => setSupplier(e.target.value)} placeholder="Ex : Point.P" /></label>
+          <label>Montant TTC<input inputMode="decimal" value={ttc} onChange={(e) => setTtc(e.target.value)} placeholder="Ex : 246,80" /></label>
+          <div className="cap-two"><label>HT<input inputMode="decimal" value={ht} onChange={(e) => setHt(e.target.value)} placeholder="HT" /></label><label>TVA<input inputMode="decimal" value={tva} onChange={(e) => setTva(e.target.value)} placeholder="TVA" /></label></div>
+          <label>Catégorie<select value={category} onChange={(e) => setCategory(e.target.value)}><option>Matériaux</option><option>Location matériel</option><option>Carburant / déplacement</option><option>Sous-traitance</option><option>Outillage</option><option>Consommables</option><option>Autre</option></select></label>
+        </div>
+      )}
+
+      <button className="cap-validate" onClick={submit} disabled={validating}>{validating ? "Validation…" : "✓ Valider la dépense"}</button>
+      <div className="cap-links">
+        <button className="cap-link" onClick={() => setShowCorrect((s) => !s)}>{showCorrect ? "Masquer" : "Corriger"}</button>
+        <button className="cap-link" onClick={onRetake}>Reprendre la photo</button>
+      </div>
+    </>
+  );
+}
+
+function CaptureOverlay({ state, doc, error, projects, defaultProjectId, validating, onValidate, onRetake, onClose }: { state: "reading" | "review" | "done"; doc: DocumentItem | null; error: string; projects: Project[]; defaultProjectId: string; validating: boolean; onValidate: (v: CaptureValues) => void; onRetake: () => void; onClose: () => void }) {
+  return (
+    <div className="cap-overlay">
+      <div className="cap-card">
+        {state !== "reading" && <div className="cap-head"><h2>{state === "done" ? "" : "Facture"}</h2><button className="cap-x" onClick={onClose} aria-label="Fermer">×</button></div>}
+
+        {state === "reading" && (
+          <div className="cap-loading"><div className="cap-spinner" /><strong>Lecture de la facture…</strong><span>Envoi de la photo et analyse automatique.</span></div>
+        )}
+
+        {state === "done" && (
+          <div className="cap-done"><div className="cap-check">✓</div><strong>Dépense enregistrée</strong><span>Le chantier a été mis à jour.</span><button className="cap-validate" onClick={onClose}>Terminé</button></div>
+        )}
+
+        {state === "review" && !doc && (
+          <div className="cap-loading"><strong>Lecture impossible</strong><span className="cap-err-banner">{error || "Une erreur est survenue."}</span><div className="cap-btns"><button className="cap-validate" onClick={onRetake}>Reprendre la photo</button><button className="cap-link" onClick={onClose}>Annuler</button></div></div>
+        )}
+
+        {state === "review" && doc && (
+          <CaptureReview key={doc.id} doc={doc} projects={projects} defaultProjectId={defaultProjectId} validating={validating} error={error} onValidate={onValidate} onRetake={onRetake} />
+        )}
+      </div>
+    </div>
+  );
 }
 
 export default function App() {
@@ -402,11 +630,23 @@ export default function App() {
   const [times, setTimes] = useState<TimeEntry[]>(initialTimeEntries);
   const [docs, setDocs] = useState<DocumentItem[]>([]);
   const [defaultExpenseProjectId, setDefaultExpenseProjectId] = useState<string | undefined>();
+  const [expensePrefill, setExpensePrefill] = useState<ExpensePrefill | undefined>();
   const [defaultTimeProjectId, setDefaultTimeProjectId] = useState<string | undefined>();
   const [defaultDocProjectId, setDefaultDocProjectId] = useState<string | undefined>();
+  const [analyzingId, setAnalyzingId] = useState<string | null>(null);
   const [userEmail, setUserEmail] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+
+  // Flux terrain (capture photo)
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [captureState, setCaptureState] = useState<"idle" | "reading" | "review" | "done">("idle");
+  const [captureDoc, setCaptureDoc] = useState<DocumentItem | null>(null);
+  const [captureError, setCaptureError] = useState("");
+  const [validating, setValidating] = useState(false);
+
+  const activeProjects = projects.filter((p) => ["in_progress", "accepted", "preparation", "to_quote"].includes(p.status));
+  const defaultCaptureProjectId = activeProjects[0]?.id || projects[0]?.id || "";
 
   async function loadProjects() {
     setLoading(true);
@@ -428,7 +668,7 @@ export default function App() {
   async function loadDocuments() {
     const { data, error } = await supabase
       .from("documents")
-      .select("id, project_id, file_name, mime_type, size_bytes, status, storage_path")
+      .select(DOCUMENT_COLUMNS)
       .order("created_at", { ascending: false });
 
     if (error) {
@@ -442,7 +682,6 @@ export default function App() {
     await loadProjects();
     await loadDocuments();
   }
-
 
   async function loginDemo() {
     setLoading(true);
@@ -491,6 +730,21 @@ export default function App() {
 
   function openExpense(projectId?: string) {
     setDefaultExpenseProjectId(projectId);
+    setExpensePrefill(undefined);
+    setPage("Ajouter une dépense");
+  }
+
+  function openExpenseFromDoc(doc: DocumentItem) {
+    setExpensePrefill({
+      projectId: doc.projectId || undefined,
+      supplier: doc.supplierName || undefined,
+      amountTtc: doc.amountTtc ?? null,
+      amountHt: doc.amountHt ?? null,
+      vatAmount: doc.vatAmount ?? null,
+      expenseDate: doc.date ?? null,
+      documentId: doc.id,
+    });
+    setDefaultExpenseProjectId(doc.projectId || undefined);
     setPage("Ajouter une dépense");
   }
 
@@ -504,39 +758,174 @@ export default function App() {
     setPage("Ajouter un document");
   }
 
-  async function saveExpense(expense: Expense) {
+  // === Flux terrain : photo → upload → lecture IA → revue ===
+  function startCapture() {
+    setCaptureError("");
+    fileInputRef.current?.click();
+  }
+
+  async function onCaptureFile(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0] || null;
+    e.target.value = ""; // permet de re-sélectionner le même fichier
+    if (!file) return;
+    await captureAndAnalyze(file);
+  }
+
+  async function captureAndAnalyze(file: File) {
+    const projectId = defaultCaptureProjectId;
+    if (!projectId) {
+      setCaptureDoc(null);
+      setCaptureError("Aucun chantier disponible pour rattacher la facture.");
+      setCaptureState("review");
+      return;
+    }
+
+    setCaptureDoc(null);
+    setCaptureError("");
+    setCaptureState("reading");
+
+    try {
+      const { data: userData } = await supabase.auth.getUser();
+      const userId = userData.user?.id;
+      if (!userId) throw new Error("Utilisateur non connecté. Reconnecte-toi en démo.");
+
+      const project = projects.find((p) => p.id === projectId);
+      const fileName = cleanFileName(file.name || "facture.jpg");
+      const storagePath = `${DEMO_ORGANIZATION_ID}/${projectId}/${Date.now()}-${fileName}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from(DOCUMENTS_BUCKET)
+        .upload(storagePath, file, { cacheControl: "3600", upsert: false, contentType: file.type || "application/octet-stream" });
+      if (uploadError) throw new Error(`Envoi de la photo impossible : ${supabaseErrorDetails(uploadError)}`);
+
+      const { data: insertedRows, error: insertError } = await supabase
+        .from("documents")
+        .insert({
+          organization_id: DEMO_ORGANIZATION_ID,
+          client_id: project?.clientId || null,
+          project_id: projectId,
+          document_type: "supplier_invoice",
+          file_name: file.name || fileName,
+          storage_path: storagePath,
+          mime_type: file.type || null,
+          size_bytes: file.size,
+          status: "to_process",
+          uploaded_by: userId,
+        })
+        .select(DOCUMENT_COLUMNS);
+      if (insertError) throw new Error(`Enregistrement impossible : ${supabaseErrorDetails(insertError)}`);
+
+      const docId = insertedRows?.[0]?.id;
+      if (!docId) throw new Error("Document créé mais introuvable.");
+
+      const { data: aiData, error: aiError } = await supabase.functions.invoke("analyze-document", { body: { documentId: docId } });
+      if (aiError) throw new Error(await invokeErrorMessage(aiError));
+      if (aiData?.error) throw new Error(aiData.error);
+
+      const { data: refreshed, error: reloadError } = await supabase
+        .from("documents")
+        .select(DOCUMENT_COLUMNS)
+        .eq("id", docId)
+        .single();
+      if (reloadError || !refreshed) throw new Error("Lecture terminée mais relecture du document impossible.");
+
+      setCaptureDoc(mapDocument(refreshed as SupabaseDocumentRow));
+      setCaptureState("review");
+      await loadDocuments();
+    } catch (err: any) {
+      setCaptureDoc(null);
+      setCaptureError(err?.message || String(err));
+      setCaptureState("review");
+    }
+  }
+
+  async function validateCapture(values: CaptureValues) {
+    setValidating(true);
+    setCaptureError("");
+    try {
+      if (captureDoc && values.projectId !== captureDoc.projectId) {
+        const { error: upErr } = await supabase.from("documents").update({ project_id: values.projectId }).eq("id", captureDoc.id);
+        if (upErr) throw new Error(`Changement de chantier impossible : ${upErr.message}`);
+      }
+
+      await persistExpense({
+        id: `e-${Date.now()}`,
+        projectId: values.projectId,
+        supplier: values.supplier,
+        category: values.category,
+        amount: values.amountTtc,
+        amountHt: values.amountHt,
+        vatAmount: values.vatAmount,
+        expenseDate: captureDoc?.date || undefined,
+        documentId: captureDoc?.id,
+      });
+
+      setCaptureState("done");
+    } catch (err: any) {
+      setCaptureError(err?.message || String(err));
+    } finally {
+      setValidating(false);
+    }
+  }
+
+  function closeCapture() {
+    setCaptureState("idle");
+    setCaptureDoc(null);
+    setCaptureError("");
+  }
+
+  function retakeCapture() {
+    setCaptureState("idle");
+    setCaptureDoc(null);
+    setCaptureError("");
+    fileInputRef.current?.click();
+  }
+
+  // Lecture IA depuis le back office (liste de documents)
+  async function analyzeDocument(doc: DocumentItem) {
+    setAnalyzingId(doc.id);
+    try {
+      const { data, error } = await supabase.functions.invoke("analyze-document", { body: { documentId: doc.id } });
+      if (error) throw new Error(await invokeErrorMessage(error));
+      if (data?.error) throw new Error(data.error);
+      await loadDocuments();
+    } catch (err: any) {
+      alert(`Analyse IA impossible : ${err?.message || String(err)}`);
+    } finally {
+      setAnalyzingId(null);
+    }
+  }
+
+  // Écriture d'une dépense (sans navigation) — partagée terrain + bureau
+  async function persistExpense(expense: Expense) {
     const { data: userData } = await supabase.auth.getUser();
     const userId = userData.user?.id;
     const project = projects.find((p) => p.id === expense.projectId);
 
-    if (!userId) {
-      throw new Error("Utilisateur non connecté. Déconnecte-toi puis reconnecte-toi en démo.");
-    }
+    if (!userId) throw new Error("Utilisateur non connecté. Déconnecte-toi puis reconnecte-toi en démo.");
+    if (!project) throw new Error("Chantier introuvable.");
 
-    if (!project) {
-      throw new Error("Chantier introuvable.");
-    }
+    const expensePayload: Record<string, any> = {
+      organization_id: DEMO_ORGANIZATION_ID,
+      project_id: expense.projectId,
+      supplier_name: expense.supplier,
+      category: expenseCategoryToSupabase(expense.category),
+      amount_ht: expense.amountHt ?? 0,
+      vat_amount: expense.vatAmount ?? 0,
+      amount_ttc: expense.amount,
+      status: "to_review",
+      notes: expense.note || null,
+      created_by: userId,
+    };
+    if (expense.expenseDate) expensePayload.expense_date = expense.expenseDate;
+    if (expense.documentId) expensePayload.document_id = expense.documentId;
 
     const { data: insertedExpense, error: insertError } = await supabase
       .from("expenses")
-      .insert({
-        organization_id: DEMO_ORGANIZATION_ID,
-        project_id: expense.projectId,
-        supplier_name: expense.supplier,
-        category: expenseCategoryToSupabase(expense.category),
-        amount_ht: 0,
-        vat_amount: 0,
-        amount_ttc: expense.amount,
-        status: "to_review",
-        notes: expense.note || null,
-        created_by: userId,
-      })
+      .insert(expensePayload)
       .select("id")
       .single();
-
-    if (insertError) {
-      throw new Error(insertError.message);
-    }
+    if (insertError) throw new Error(insertError.message);
 
     const nextExpensesTotal = project.expenses + expense.amount;
     const nextRealCost = nextExpensesTotal + project.laborCost;
@@ -552,19 +941,16 @@ export default function App() {
         real_margin_rate: nextRealMarginRate,
       })
       .eq("id", expense.projectId);
+    if (updateError) throw new Error(`Dépense créée, mais mise à jour du chantier impossible : ${updateError.message}`);
 
-    if (updateError) {
-      throw new Error(`Dépense créée, mais mise à jour du chantier impossible : ${updateError.message}`);
-    }
+    setExpenses((current) => [{ ...expense, id: insertedExpense?.id || expense.id }, ...current]);
+    await refreshAll();
+  }
 
-    setExpenses((current) => [
-      { ...expense, id: insertedExpense?.id || expense.id },
-      ...current,
-    ]);
-
-    await loadProjects();
-
+  async function saveExpense(expense: Expense) {
+    await persistExpense(expense);
     setDefaultExpenseProjectId(undefined);
+    setExpensePrefill(undefined);
     setPage(mode === "terrain" ? "Terrain" : "Chantiers");
   }
 
@@ -573,13 +959,8 @@ export default function App() {
     const userId = userData.user?.id;
     const project = projects.find((p) => p.id === entry.projectId);
 
-    if (!userId) {
-      throw new Error("Utilisateur non connecté. Déconnecte-toi puis reconnecte-toi en démo.");
-    }
-
-    if (!project) {
-      throw new Error("Chantier introuvable.");
-    }
+    if (!userId) throw new Error("Utilisateur non connecté. Déconnecte-toi puis reconnecte-toi en démo.");
+    if (!project) throw new Error("Chantier introuvable.");
 
     const amount = entry.hours * entry.hourlyRate;
 
@@ -596,10 +977,7 @@ export default function App() {
       })
       .select("id")
       .single();
-
-    if (insertError) {
-      throw new Error(insertError.message);
-    }
+    if (insertError) throw new Error(insertError.message);
 
     const nextLaborCost = project.laborCost + amount;
     const nextRealCost = project.expenses + nextLaborCost;
@@ -615,16 +993,9 @@ export default function App() {
         real_margin_rate: nextRealMarginRate,
       })
       .eq("id", entry.projectId);
+    if (updateError) throw new Error(`Temps créé, mais mise à jour du chantier impossible : ${updateError.message}`);
 
-    if (updateError) {
-      throw new Error(`Temps créé, mais mise à jour du chantier impossible : ${updateError.message}`);
-    }
-
-    setTimes((current) => [
-      { ...entry, id: insertedTime?.id || entry.id },
-      ...current,
-    ]);
-
+    setTimes((current) => [{ ...entry, id: insertedTime?.id || entry.id }, ...current]);
     await loadProjects();
 
     setDefaultTimeProjectId(undefined);
@@ -636,39 +1007,19 @@ export default function App() {
     const userId = userData.user?.id;
     const project = projects.find((p) => p.id === doc.projectId);
 
-    if (userError) {
-      throw new Error(`Impossible de récupérer l’utilisateur connecté : ${supabaseErrorDetails(userError)}`);
-    }
-
-    if (!userId) {
-      throw new Error("Utilisateur non connecté. Déconnecte-toi puis reconnecte-toi en démo.");
-    }
-
-    if (!project) {
-      throw new Error("Chantier introuvable. Rafraîchis Supabase puis réessaie.");
-    }
-
-    if (!doc.file) {
-      throw new Error("Aucun fichier sélectionné.");
-    }
+    if (userError) throw new Error(`Impossible de récupérer l’utilisateur connecté : ${supabaseErrorDetails(userError)}`);
+    if (!userId) throw new Error("Utilisateur non connecté. Déconnecte-toi puis reconnecte-toi en démo.");
+    if (!project) throw new Error("Chantier introuvable. Rafraîchis Supabase puis réessaie.");
+    if (!doc.file) throw new Error("Aucun fichier sélectionné.");
 
     const fileName = cleanFileName(doc.file.name);
     const storagePath = `${DEMO_ORGANIZATION_ID}/${doc.projectId}/${Date.now()}-${fileName}`;
 
-    // Étape 1 : envoyer le fichier dans Supabase Storage.
     const { error: uploadError } = await supabase.storage
       .from(DOCUMENTS_BUCKET)
-      .upload(storagePath, doc.file, {
-        cacheControl: "3600",
-        upsert: false,
-        contentType: doc.file.type || "application/octet-stream",
-      });
+      .upload(storagePath, doc.file, { cacheControl: "3600", upsert: false, contentType: doc.file.type || "application/octet-stream" });
+    if (uploadError) throw new Error(`Étape 1/2 échouée — upload Storage impossible : ${supabaseErrorDetails(uploadError)}`);
 
-    if (uploadError) {
-      throw new Error(`Étape 1/2 échouée — upload Storage impossible : ${supabaseErrorDetails(uploadError)}`);
-    }
-
-    // Étape 2 : créer la ligne correspondante dans public.documents.
     const documentPayload = {
       organization_id: DEMO_ORGANIZATION_ID,
       client_id: project.clientId || null,
@@ -685,21 +1036,14 @@ export default function App() {
     const { data: insertedRows, error: insertError } = await supabase
       .from("documents")
       .insert(documentPayload)
-      .select("id, project_id, file_name, mime_type, size_bytes, status, storage_path");
+      .select(DOCUMENT_COLUMNS);
 
     if (insertError) {
-      // On tente de nettoyer le fichier envoyé pour éviter un fichier orphelin.
-      const { error: removeError } = await supabase.storage
-        .from(DOCUMENTS_BUCKET)
-        .remove([storagePath]);
-
+      const { error: removeError } = await supabase.storage.from(DOCUMENTS_BUCKET).remove([storagePath]);
       const cleanupMessage = removeError
         ? ` Nettoyage Storage impossible : ${supabaseErrorDetails(removeError)}`
         : " Le fichier envoyé a été retiré du Storage.";
-
-      throw new Error(
-        `Étape 2/2 échouée — le fichier a été envoyé, mais la ligne documents n’a pas été créée : ${supabaseErrorDetails(insertError)}.${cleanupMessage}`
-      );
+      throw new Error(`Étape 2/2 échouée — le fichier a été envoyé, mais la ligne documents n’a pas été créée : ${supabaseErrorDetails(insertError)}.${cleanupMessage}`);
     }
 
     const insertedDoc = insertedRows?.[0];
@@ -707,28 +1051,16 @@ export default function App() {
     if (!insertedDoc) {
       const { data: verificationRows, error: verificationError } = await supabase
         .from("documents")
-        .select("id, project_id, file_name, mime_type, size_bytes, status, storage_path")
+        .select(DOCUMENT_COLUMNS)
         .eq("storage_path", storagePath)
         .limit(1);
-
-      if (verificationError) {
-        throw new Error(
-          `Document peut-être créé, mais impossible de le relire : ${supabaseErrorDetails(verificationError)}. Chemin Storage : ${storagePath}`
-        );
-      }
-
-      if (!verificationRows || verificationRows.length === 0) {
-        throw new Error(
-          `Upload Storage réussi, mais aucune ligne documents n’a été retrouvée. Chemin Storage : ${storagePath}`
-        );
-      }
-
+      if (verificationError) throw new Error(`Document peut-être créé, mais impossible de le relire : ${supabaseErrorDetails(verificationError)}. Chemin Storage : ${storagePath}`);
+      if (!verificationRows || verificationRows.length === 0) throw new Error(`Upload Storage réussi, mais aucune ligne documents n’a été retrouvée. Chemin Storage : ${storagePath}`);
       setDocs((current) => [mapDocument(verificationRows[0] as SupabaseDocumentRow), ...current]);
     } else {
       setDocs((current) => [mapDocument(insertedDoc as SupabaseDocumentRow), ...current]);
     }
 
-    // Étape 3 : recharger la liste depuis Supabase pour vérifier l’affichage réel.
     await loadDocuments();
 
     setDefaultDocProjectId(undefined);
@@ -741,16 +1073,11 @@ export default function App() {
         alert("Chemin Storage manquant pour ce document.");
         return;
       }
-
-      const { data, error } = await supabase.storage
-        .from(DOCUMENTS_BUCKET)
-        .createSignedUrl(document.storagePath, 60);
-
+      const { data, error } = await supabase.storage.from(DOCUMENTS_BUCKET).createSignedUrl(document.storagePath, 60);
       if (error || !data?.signedUrl) {
         alert(`Impossible d'ouvrir le document : ${supabaseErrorDetails(error)}`);
         return;
       }
-
       window.open(data.signedUrl, "_blank", "noopener,noreferrer");
     } catch (err: any) {
       alert(`Impossible d'ouvrir le document : ${err?.message || String(err)}`);
@@ -760,30 +1087,33 @@ export default function App() {
   function render() {
     if (loading && projects.length === 0) return <main className="content"><div className="panel"><h2>Chargement Supabase...</h2><p className="empty">Connexion au projet HUB Artisans.</p></div></main>;
     if (error) return <main className="content"><div className="big-alert"><strong>Erreur Supabase</strong><span>{error}</span></div><button className="primary" onClick={refreshAll}>Réessayer</button></main>;
-    if (page === "Ajouter une dépense") return <ExpenseForm projects={projects} defaultProjectId={defaultExpenseProjectId} cancel={() => setPage(mode === "terrain" ? "Terrain" : "Chantiers")} save={saveExpense} />;
+    if (page === "Ajouter une dépense") return <ExpenseForm projects={projects} defaultProjectId={defaultExpenseProjectId} prefill={expensePrefill} cancel={() => { setExpensePrefill(undefined); setPage(mode === "terrain" ? "Terrain" : "Chantiers"); }} save={saveExpense} />;
     if (page === "Ajouter du temps") return <TimeForm projects={projects} defaultProjectId={defaultTimeProjectId} cancel={() => setPage(mode === "terrain" ? "Terrain" : "Chantiers")} save={saveTime} />;
     if (page === "Ajouter un document") return <DocumentForm projects={projects} defaultProjectId={defaultDocProjectId} cancel={() => setPage(mode === "terrain" ? "Terrain" : "Documents IA")} save={saveDoc} />;
-    if (page === "Fiche chantier" && selected) return <ProjectDetail project={projects.find((p) => p.id === selected.id) || selected} expenses={expenses} times={times} docs={docs} back={() => setPage(mode === "terrain" ? "Terrain" : "Chantiers")} openExpense={openExpense} openTime={openTime} openDoc={openDoc} openStoredDocument={openStoredDocument} />;
+    if (page === "Fiche chantier" && selected) return <ProjectDetail project={projects.find((p) => p.id === selected.id) || selected} expenses={expenses} times={times} docs={docs} back={() => setPage(mode === "terrain" ? "Terrain" : "Chantiers")} openExpense={openExpense} openTime={openTime} openDoc={openDoc} openStoredDocument={openStoredDocument} analyzeDocument={analyzeDocument} analyzingId={analyzingId} openExpenseFromDoc={openExpenseFromDoc} />;
     if (mode === "terrain") {
-      if (page === "Terrain" || page === "Chantiers") return <FieldPage projects={projects} docs={docs} openProject={openProject} openExpense={() => openExpense()} openTime={() => openTime()} openDoc={() => openDoc()} />;
-      if (page === "Dépenses") return <ExpenseForm projects={projects} defaultProjectId={defaultExpenseProjectId} cancel={() => setPage("Terrain")} save={saveExpense} />;
+      if (page === "Terrain" || page === "Chantiers") return <FieldPage projects={projects} docs={docs} openProject={openProject} onCapture={startCapture} openTime={() => openTime()} openExpense={() => openExpense()} />;
       if (page === "Temps passé") return <TimeForm projects={projects} defaultProjectId={defaultTimeProjectId} cancel={() => setPage("Terrain")} save={saveTime} />;
-      if (page === "Documents IA") return <DocumentsPage projects={projects} docs={docs} openDoc={() => openDoc()} openStoredDocument={openStoredDocument} />;
+      if (page === "Documents IA") return <DocumentsPage projects={projects} docs={docs} openDoc={startCapture} openStoredDocument={openStoredDocument} analyzeDocument={analyzeDocument} analyzingId={analyzingId} openExpenseFromDoc={openExpenseFromDoc} addLabel="📷 Photographier" />;
       return <Placeholder title={page} />;
     }
     if (page === "Dashboard") return <Dashboard projects={projects} docs={docs} openProject={openProject} refresh={refreshAll} />;
     if (page === "Chantiers") return <ProjectsPage projects={projects} openProject={openProject} />;
-    if (page === "Dépenses") return <ExpenseForm projects={projects} defaultProjectId={defaultExpenseProjectId} cancel={() => setPage("Dashboard")} save={saveExpense} />;
+    if (page === "Dépenses") return <ExpenseForm projects={projects} defaultProjectId={defaultExpenseProjectId} prefill={expensePrefill} cancel={() => { setExpensePrefill(undefined); setPage("Dashboard"); }} save={saveExpense} />;
     if (page === "Temps passé") return <TimeForm projects={projects} defaultProjectId={defaultTimeProjectId} cancel={() => setPage("Dashboard")} save={saveTime} />;
-    if (page === "Documents IA") return <DocumentsPage projects={projects} docs={docs} openDoc={() => openDoc()} openStoredDocument={openStoredDocument} />;
+    if (page === "Documents IA") return <DocumentsPage projects={projects} docs={docs} openDoc={() => openDoc()} openStoredDocument={openStoredDocument} analyzeDocument={analyzeDocument} analyzingId={analyzingId} openExpenseFromDoc={openExpenseFromDoc} addLabel="+ Document" />;
     return <Placeholder title={page} />;
   }
 
   if (!userEmail) return <><style>{styles}</style><Login loading={loading} error={error} onLogin={loginDemo} /></>;
 
-  return <><style>{styles}</style><div className="app"><Sidebar mode={mode} page={page} setPage={(next) => { setPage(next); if (next !== "Fiche chantier") setSelected(null); }} /><div className="main"><header className="topbar"><div><strong>Menuiserie Le Gall Aluminium</strong><span>{mode === "terrain" ? "Mode terrain — chantiers Supabase" : "Mode bureau — pilotage Supabase"}</span></div><div className="topbar-actions"><ModeToggle mode={mode} setMode={switchMode} /><button className="logout" onClick={logout}>Déconnexion</button><div className="user-pill">DL</div></div></header>{render()}</div></div></>;
+  return <><style>{styles}</style>
+    <input ref={fileInputRef} type="file" accept="image/*,.pdf" capture="environment" style={{ display: "none" }} onChange={onCaptureFile} />
+    <div className="app"><Sidebar mode={mode} page={page} setPage={(next) => { setPage(next); if (next !== "Fiche chantier") setSelected(null); }} /><div className="main"><header className="topbar"><div><strong>Menuiserie Le Gall Aluminium</strong><span>{mode === "terrain" ? "Mode terrain — chantiers Supabase" : "Mode bureau — pilotage Supabase"}</span></div><div className="topbar-actions"><ModeToggle mode={mode} setMode={switchMode} /><button className="logout" onClick={logout}>Déconnexion</button><div className="user-pill">DL</div></div></header>{render()}</div></div>
+    {captureState !== "idle" && <CaptureOverlay state={captureState} doc={captureDoc} error={captureError} projects={projects} defaultProjectId={defaultCaptureProjectId} validating={validating} onValidate={validateCapture} onRetake={retakeCapture} onClose={closeCapture} />}
+  </>;
 }
 
 const styles = `
-*{box-sizing:border-box}body{margin:0;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f4f6f8;color:#14213d}button,input,select,textarea{font:inherit}.login-page{min-height:100vh;background:#101828;display:grid;place-items:center;padding:24px}.login-card{width:100%;max-width:430px;background:white;border-radius:28px;padding:32px;text-align:center;box-shadow:0 24px 70px rgba(0,0,0,.2)}.login-card h1{margin:16px 0 8px;font-size:34px;letter-spacing:-.05em}.login-card p{color:#667085}.login-card span{display:block;margin-top:14px;color:#98a2b3;font-size:13px}.app{display:flex;min-height:100vh}.sidebar{width:265px;background:#101828;color:white;padding:24px 18px;display:flex;flex-direction:column;gap:28px}.brand{display:flex;align-items:center;gap:12px}.brand-icon{width:42px;height:42px;border-radius:14px;background:#f97316;display:flex;align-items:center;justify-content:center;font-weight:900;color:white}.brand-icon.big{width:58px;height:58px;border-radius:18px;margin:0 auto;font-size:24px}.brand strong{display:block;font-size:18px}.brand span{display:block;color:#98a2b3;font-size:13px}.sidebar nav{display:grid;gap:8px}.sidebar nav button{border:0;background:transparent;color:#cbd5e1;text-align:left;padding:12px 14px;border-radius:12px;cursor:pointer}.sidebar nav button:hover,.sidebar nav button.active{background:#1d2939;color:white}.main{flex:1;min-width:0}.topbar{min-height:72px;background:white;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between;padding:14px 32px;gap:16px}.topbar strong{display:block}.topbar span{display:block;color:#667085;font-size:14px}.topbar-actions{display:flex;align-items:center;gap:14px}.logout{border:1px solid #d0d5dd;background:white;color:#14213d;border-radius:999px;padding:8px 12px;font-weight:800;cursor:pointer}.mode-toggle{display:flex;background:#f2f4f7;padding:4px;border-radius:999px;border:1px solid #e5e7eb}.mode-toggle button{border:0;background:transparent;padding:8px 14px;border-radius:999px;cursor:pointer;font-weight:800;color:#667085}.mode-toggle button.selected{background:#14213d;color:white}.user-pill{width:42px;height:42px;border-radius:999px;background:#14213d;color:white;display:flex;align-items:center;justify-content:center;font-weight:800}.content{padding:32px}.field-content{max-width:780px;margin:0 auto}.hero{background:#14213d;color:white;border-radius:28px;padding:26px;display:flex;justify-content:space-between;gap:18px;align-items:center;margin-bottom:18px}.hero span{color:#fed7aa;font-weight:800;font-size:13px;text-transform:uppercase}.hero h1{margin:6px 0;font-size:34px;letter-spacing:-.05em}.hero p{margin:0;color:#d0d5dd}.alert-count{min-width:88px;height:88px;border-radius:24px;background:#f97316;display:flex;flex-direction:column;align-items:center;justify-content:center}.alert-count strong{font-size:30px;line-height:1}.alert-count span{color:white;text-transform:none}.quick{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:18px}.quick button{border:0;background:white;border-radius:18px;padding:16px 12px;font-weight:900;color:#14213d;box-shadow:0 10px 30px rgba(15,23,42,.04);border:1px solid #e5e7eb;cursor:pointer}.cards{display:grid;gap:14px}.field-card{border:1px solid #e5e7eb;background:white;border-radius:24px;padding:18px;text-align:left;cursor:pointer;box-shadow:0 10px 30px rgba(15,23,42,.04)}.field-card.danger{border-color:#fecaca;background:#fffafa}.card-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start}.card-head h2{margin:0;font-size:20px;letter-spacing:-.03em}.card-head p{margin:6px 0 0;color:#667085}.profit-row{display:flex;align-items:center;gap:16px;margin-top:18px}.circle{min-width:92px;height:92px;border-radius:999px;background:#dcfce7;color:#15803d;display:flex;flex-direction:column;align-items:center;justify-content:center}.circle.danger{background:#fee2e2;color:#b91c1c}.circle strong{font-size:26px;line-height:1}.circle span{margin-top:4px;font-size:12px;font-weight:800}.profit-row strong{display:block;font-size:18px}.profit-row span{display:block;color:#667085;margin-top:4px}.profit-row em{display:block;color:#f97316;font-style:normal;font-weight:800;margin-top:8px}.footer{display:flex;justify-content:space-between;margin-top:16px;padding-top:14px;border-top:1px solid #eef2f6;color:#f97316;font-weight:900}.page-header{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.page-header h1{margin:0;font-size:32px;letter-spacing:-.04em}.page-header p{margin:8px 0 0;color:#667085}.primary,.panel-head button,.actions button{border:0;background:#f97316;color:white;border-radius:12px;padding:11px 16px;font-weight:700;cursor:pointer}.primary:disabled{opacity:.6;cursor:wait}.secondary{border:1px solid #d0d5dd;background:white;color:#14213d;border-radius:12px;padding:11px 16px;font-weight:700;cursor:pointer}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:24px}.stat,.panel,.project-card,.form{background:white;border:1px solid #e5e7eb;border-radius:22px;box-shadow:0 10px 30px rgba(15,23,42,.04)}.stat{padding:20px}.stat p{margin:0 0 10px;color:#667085;font-size:14px}.stat strong{display:block;font-size:26px;letter-spacing:-.04em}.stat span{display:block;color:#98a2b3;font-size:13px;margin-top:8px}.columns{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px}.panel{padding:22px}.panel h2{margin:0 0 16px;font-size:20px}.todo,.alert,.line,.summary{border:1px solid #eef2f6;background:#f8fafc;border-radius:16px;padding:14px;margin-bottom:10px}.todo strong,.alert strong,.line strong,.summary strong{display:block}.todo span,.alert span,.line span,.empty,.summary span{display:block;color:#667085;margin-top:4px;font-size:14px}.todo.warning,.big-alert,.info{background:#fff7ed;border:1px solid #fed7aa;border-radius:18px;padding:16px;margin-bottom:18px}.big-alert strong{display:block;color:#c2410c}.big-alert span,.info span{display:block;color:#9a3412;margin-top:4px}.form{padding:22px;display:grid;gap:16px}.form label{display:grid;gap:8px;color:#344054;font-weight:800}.form input,.form select,.form textarea{width:100%;border:1px solid #d0d5dd;border-radius:14px;padding:13px 14px;background:white;color:#14213d}.form textarea{min-height:96px;resize:vertical}.error{background:#fee2e2;color:#991b1b;border:1px solid #fecaca;border-radius:14px;padding:12px 14px;font-weight:800;margin:14px 0}.right{justify-content:flex-end}.table{display:grid;gap:6px}.row{display:grid;grid-template-columns:1.7fr 1.1fr .9fr .8fr .8fr .8fr .6fr;gap:12px;align-items:center;padding:14px;border-radius:14px;border:0;text-align:left;background:#f8fafc;color:inherit}.head{font-weight:800;color:#667085;background:transparent}.clickable{cursor:pointer}.clickable:hover{background:#eef2ff}.badge{display:inline-flex;align-items:center;justify-content:center;border-radius:999px;padding:6px 10px;font-size:12px;font-weight:800;white-space:nowrap;background:#f3f4f6;color:#374151}.badge-in_progress{background:#dbeafe;color:#1d4ed8}.badge-accepted{background:#dcfce7;color:#15803d}.badge-preparation{background:#fef3c7;color:#b45309}.badge-to_quote{background:#f3f4f6;color:#374151}.badge-completed{background:#e0e7ff;color:#4338ca}.danger-text{color:#dc2626;font-weight:800}.success-text{color:#16a34a;font-weight:800}.search{width:100%;border:1px solid #d0d5dd;border-radius:14px;padding:14px 16px;margin-bottom:20px;background:white}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.project-card{padding:20px;text-align:left;cursor:pointer}.project-card:hover{border-color:#f97316}.numbers{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:22px}.numbers span,.margin-line span{display:block;color:#667085;font-size:13px}.numbers strong{display:block;margin-top:4px}.margin-line{display:flex;justify-content:space-between;align-items:center;margin-top:18px;border-top:1px solid #eef2f6;padding-top:16px}.back{border:0;background:transparent;color:#f97316;font-weight:800;cursor:pointer;margin-bottom:16px}.panel-head{display:flex;justify-content:space-between;align-items:center}.panel-head button{padding:8px 12px;font-size:14px}.line{display:flex;justify-content:space-between;gap:16px}.actions{display:flex;gap:12px;flex-wrap:wrap}.doc,.doc-item{border:1px solid #eef2f6;background:#f8fafc;border-radius:16px;padding:14px}.doc strong,.doc span,.doc em{display:block}.doc span{color:#667085;margin-top:4px}.doc em{color:#f97316;font-style:normal;font-weight:800;margin-top:6px}.doc-list{display:grid;gap:12px}.doc-item{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.doc-item strong,.doc-item span,.doc-item em{display:block}.doc-item span{color:#667085;margin-top:4px}.doc-item em{color:#f97316;font-style:normal;font-weight:800;margin-top:4px}.doc-status{background:#fff7ed;color:#c2410c!important;border-radius:999px;padding:6px 10px;font-weight:900;white-space:nowrap;margin-top:0!important}.doc-item small{display:block;color:#98a2b3;margin-top:4px;font-size:12px;word-break:break-all}.doc-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-end}.open-doc{border:1px solid #f97316;background:white;color:#f97316;border-radius:999px;padding:7px 12px;font-weight:900;cursor:pointer}.open-doc:hover{background:#fff7ed}@media(max-width:1050px){.stats,.columns,.grid{grid-template-columns:1fr}.sidebar{width:230px}.row{grid-template-columns:1fr}.head{display:none}}@media(max-width:780px){.app{flex-direction:column}.sidebar{width:100%}.sidebar nav{grid-template-columns:repeat(2,1fr)}.content{padding:20px}.topbar{padding:14px 20px;align-items:flex-start;flex-direction:column}.topbar-actions{width:100%;justify-content:space-between;flex-wrap:wrap}.quick{grid-template-columns:1fr}.hero{align-items:flex-start;flex-direction:column}.right,.doc-item{flex-direction:column}.doc-actions{align-items:flex-start;justify-content:flex-start}.right button{width:100%}}
+*{box-sizing:border-box}body{margin:0;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f4f6f8;color:#14213d}button,input,select,textarea{font:inherit}.login-page{min-height:100vh;background:#101828;display:grid;place-items:center;padding:24px}.login-card{width:100%;max-width:430px;background:white;border-radius:28px;padding:32px;text-align:center;box-shadow:0 24px 70px rgba(0,0,0,.2)}.login-card h1{margin:16px 0 8px;font-size:34px;letter-spacing:-.05em}.login-card p{color:#667085}.login-card span{display:block;margin-top:14px;color:#98a2b3;font-size:13px}.app{display:flex;min-height:100vh}.sidebar{width:265px;background:#101828;color:white;padding:24px 18px;display:flex;flex-direction:column;gap:28px}.brand{display:flex;align-items:center;gap:12px}.brand-icon{width:42px;height:42px;border-radius:14px;background:#f97316;display:flex;align-items:center;justify-content:center;font-weight:900;color:white}.brand-icon.big{width:58px;height:58px;border-radius:18px;margin:0 auto;font-size:24px}.brand strong{display:block;font-size:18px}.brand span{display:block;color:#98a2b3;font-size:13px}.sidebar nav{display:grid;gap:8px}.sidebar nav button{border:0;background:transparent;color:#cbd5e1;text-align:left;padding:12px 14px;border-radius:12px;cursor:pointer}.sidebar nav button:hover,.sidebar nav button.active{background:#1d2939;color:white}.main{flex:1;min-width:0}.topbar{min-height:72px;background:white;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;justify-content:space-between;padding:14px 32px;gap:16px}.topbar strong{display:block}.topbar span{display:block;color:#667085;font-size:14px}.topbar-actions{display:flex;align-items:center;gap:14px}.logout{border:1px solid #d0d5dd;background:white;color:#14213d;border-radius:999px;padding:8px 12px;font-weight:800;cursor:pointer}.mode-toggle{display:flex;background:#f2f4f7;padding:4px;border-radius:999px;border:1px solid #e5e7eb}.mode-toggle button{border:0;background:transparent;padding:8px 14px;border-radius:999px;cursor:pointer;font-weight:800;color:#667085}.mode-toggle button.selected{background:#14213d;color:white}.user-pill{width:42px;height:42px;border-radius:999px;background:#14213d;color:white;display:flex;align-items:center;justify-content:center;font-weight:800}.content{padding:32px}.field-content{max-width:780px;margin:0 auto}.hero{background:#14213d;color:white;border-radius:28px;padding:26px;display:flex;justify-content:space-between;gap:18px;align-items:center;margin-bottom:18px}.hero span{color:#fed7aa;font-weight:800;font-size:13px;text-transform:uppercase}.hero h1{margin:6px 0;font-size:34px;letter-spacing:-.05em}.hero p{margin:0;color:#d0d5dd}.alert-count{min-width:88px;height:88px;border-radius:24px;background:#f97316;display:flex;flex-direction:column;align-items:center;justify-content:center}.alert-count strong{font-size:30px;line-height:1}.alert-count span{color:white;text-transform:none}.capture-cta{margin-bottom:14px}.capture-btn{width:100%;border:0;background:#f97316;color:white;border-radius:24px;padding:26px 20px;display:flex;flex-direction:column;align-items:center;gap:4px;cursor:pointer;box-shadow:0 16px 38px rgba(249,115,22,.32)}.capture-btn .cam{font-size:44px;line-height:1}.capture-btn>span:nth-child(2){font-size:21px;font-weight:900;margin-top:6px}.capture-btn small{font-weight:700;opacity:.95;font-size:13px}.capture-btn:active{transform:scale(.99)}.quick{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:18px}.quick button{border:0;background:white;border-radius:18px;padding:16px 12px;font-weight:900;color:#14213d;box-shadow:0 10px 30px rgba(15,23,42,.04);border:1px solid #e5e7eb;cursor:pointer}.quick.small{grid-template-columns:1fr 1fr}.quick.small button{padding:13px;font-size:14px}.cards{display:grid;gap:14px}.field-card{border:1px solid #e5e7eb;background:white;border-radius:24px;padding:18px;text-align:left;cursor:pointer;box-shadow:0 10px 30px rgba(15,23,42,.04)}.field-card.danger{border-color:#fecaca;background:#fffafa}.card-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start}.card-head h2{margin:0;font-size:20px;letter-spacing:-.03em}.card-head p{margin:6px 0 0;color:#667085}.profit-row{display:flex;align-items:center;gap:16px;margin-top:18px}.circle{min-width:92px;height:92px;border-radius:999px;background:#dcfce7;color:#15803d;display:flex;flex-direction:column;align-items:center;justify-content:center}.circle.danger{background:#fee2e2;color:#b91c1c}.circle strong{font-size:26px;line-height:1}.circle span{margin-top:4px;font-size:12px;font-weight:800}.profit-row strong{display:block;font-size:18px}.profit-row span{display:block;color:#667085;margin-top:4px}.profit-row em{display:block;color:#f97316;font-style:normal;font-weight:800;margin-top:8px}.footer{display:flex;justify-content:space-between;margin-top:16px;padding-top:14px;border-top:1px solid #eef2f6;color:#f97316;font-weight:900}.page-header{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.page-header h1{margin:0;font-size:32px;letter-spacing:-.04em}.page-header p{margin:8px 0 0;color:#667085}.primary,.panel-head button,.actions button{border:0;background:#f97316;color:white;border-radius:12px;padding:11px 16px;font-weight:700;cursor:pointer}.primary:disabled{opacity:.6;cursor:wait}.secondary{border:1px solid #d0d5dd;background:white;color:#14213d;border-radius:12px;padding:11px 16px;font-weight:700;cursor:pointer}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:24px}.stat,.panel,.project-card,.form{background:white;border:1px solid #e5e7eb;border-radius:22px;box-shadow:0 10px 30px rgba(15,23,42,.04)}.stat{padding:20px}.stat p{margin:0 0 10px;color:#667085;font-size:14px}.stat strong{display:block;font-size:26px;letter-spacing:-.04em}.stat span{display:block;color:#98a2b3;font-size:13px;margin-top:8px}.columns{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px}.panel{padding:22px}.panel h2{margin:0 0 16px;font-size:20px}.todo,.alert,.line,.summary{border:1px solid #eef2f6;background:#f8fafc;border-radius:16px;padding:14px;margin-bottom:10px}.todo strong,.alert strong,.line strong,.summary strong{display:block}.todo span,.alert span,.line span,.empty,.summary span{display:block;color:#667085;margin-top:4px;font-size:14px}.todo.warning,.big-alert,.info{background:#fff7ed;border:1px solid #fed7aa;border-radius:18px;padding:16px;margin-bottom:18px}.big-alert strong{display:block;color:#c2410c}.big-alert span,.info span{display:block;color:#9a3412;margin-top:4px}.form{padding:22px;display:grid;gap:16px}.form label{display:grid;gap:8px;color:#344054;font-weight:800}.form input,.form select,.form textarea{width:100%;border:1px solid #d0d5dd;border-radius:14px;padding:13px 14px;background:white;color:#14213d}.form textarea{min-height:96px;resize:vertical}.vat-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:14px;color:#667085;font-weight:700;margin-top:-6px}.vat-tools button{border:1px solid #d0d5dd;background:white;color:#14213d;border-radius:999px;padding:6px 12px;font-weight:800;cursor:pointer}.vat-tools button:hover{border-color:#f97316;color:#f97316}.two-cols{display:grid;grid-template-columns:1fr 1fr;gap:16px}.error{background:#fee2e2;color:#991b1b;border:1px solid #fecaca;border-radius:14px;padding:12px 14px;font-weight:800;margin:14px 0}.right{justify-content:flex-end}.table{display:grid;gap:6px}.row{display:grid;grid-template-columns:1.7fr 1.1fr .9fr .8fr .8fr .8fr .6fr;gap:12px;align-items:center;padding:14px;border-radius:14px;border:0;text-align:left;background:#f8fafc;color:inherit}.head{font-weight:800;color:#667085;background:transparent}.clickable{cursor:pointer}.clickable:hover{background:#eef2ff}.badge{display:inline-flex;align-items:center;justify-content:center;border-radius:999px;padding:6px 10px;font-size:12px;font-weight:800;white-space:nowrap;background:#f3f4f6;color:#374151}.badge-in_progress{background:#dbeafe;color:#1d4ed8}.badge-accepted{background:#dcfce7;color:#15803d}.badge-preparation{background:#fef3c7;color:#b45309}.badge-to_quote{background:#f3f4f6;color:#374151}.badge-completed{background:#e0e7ff;color:#4338ca}.danger-text{color:#dc2626;font-weight:800}.success-text{color:#16a34a;font-weight:800}.search{width:100%;border:1px solid #d0d5dd;border-radius:14px;padding:14px 16px;margin-bottom:20px;background:white}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.project-card{padding:20px;text-align:left;cursor:pointer}.project-card:hover{border-color:#f97316}.numbers{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:22px}.numbers span,.margin-line span{display:block;color:#667085;font-size:13px}.numbers strong{display:block;margin-top:4px}.margin-line{display:flex;justify-content:space-between;align-items:center;margin-top:18px;border-top:1px solid #eef2f6;padding-top:16px}.back{border:0;background:transparent;color:#f97316;font-weight:800;cursor:pointer;margin-bottom:16px}.panel-head{display:flex;justify-content:space-between;align-items:center}.panel-head button{padding:8px 12px;font-size:14px}.line{display:flex;justify-content:space-between;gap:16px}.actions{display:flex;gap:12px;flex-wrap:wrap}.doc,.doc-item{border:1px solid #eef2f6;background:#f8fafc;border-radius:16px;padding:14px}.doc strong,.doc span,.doc em{display:block}.doc span{color:#667085;margin-top:4px}.doc em{color:#f97316;font-style:normal;font-weight:800;margin-top:6px}.doc-list{display:grid;gap:12px}.doc-item{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.doc-item strong,.doc-item span,.doc-item em{display:block}.doc-item span{color:#667085;margin-top:4px}.doc-item em{color:#f97316;font-style:normal;font-weight:800;margin-top:4px}.doc-status{background:#fff7ed;color:#c2410c!important;border-radius:999px;padding:6px 10px;font-weight:900;white-space:nowrap;margin-top:0!important}.doc-item small{display:block;color:#98a2b3;margin-top:4px;font-size:12px;word-break:break-all}.doc-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-end}.open-doc{border:1px solid #f97316;background:white;color:#f97316;border-radius:999px;padding:7px 12px;font-weight:900;cursor:pointer}.open-doc:hover{background:#fff7ed}.open-doc:disabled{opacity:.6;cursor:wait}.open-doc.doc-cta{background:#f97316;color:white}.open-doc.doc-cta:hover{background:#ea6a08}.ai-extract{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:10px;background:white;border:1px solid #eef2f6;border-radius:12px;padding:10px}.ai-extract>div{min-width:0}.ai-extract span{display:block;color:#98a2b3;font-size:11px;margin-top:0;text-transform:uppercase;letter-spacing:.03em}.ai-extract strong{display:block;font-size:14px;margin-top:2px;color:#14213d;word-break:break-word}.cap-overlay{position:fixed;inset:0;background:rgba(16,24,40,.55);display:grid;place-items:center;padding:16px;z-index:50}.cap-card{width:100%;max-width:460px;background:white;border-radius:24px;padding:22px;box-shadow:0 24px 70px rgba(0,0,0,.3);max-height:94vh;overflow:auto}.cap-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}.cap-head h2{margin:0;font-size:16px;color:#667085;font-weight:800}.cap-x{border:0;background:#f2f4f7;width:34px;height:34px;border-radius:50%;font-size:20px;line-height:1;cursor:pointer;color:#667085}.cap-loading,.cap-done{display:flex;flex-direction:column;align-items:center;gap:10px;text-align:center;padding:22px 8px}.cap-loading strong,.cap-done strong{font-size:20px}.cap-loading span,.cap-done span{color:#667085}.cap-spinner{width:48px;height:48px;border-radius:50%;border:5px solid #fde7d3;border-top-color:#f97316;animation:capspin 1s linear infinite}@keyframes capspin{to{transform:rotate(360deg)}}.cap-check{width:64px;height:64px;border-radius:50%;background:#dcfce7;color:#15803d;font-size:34px;font-weight:900;display:grid;place-items:center}.cap-amount{font-size:42px;font-weight:900;letter-spacing:-.04em;color:#14213d;text-align:center;margin:4px 0}.cap-supplier{font-size:20px;font-weight:800;text-align:center;color:#14213d}.cap-meta{text-align:center;color:#667085;margin-top:8px;font-weight:700;display:flex;gap:8px;justify-content:center;align-items:center;flex-wrap:wrap}.cap-novat{display:inline-block;background:#fff7ed;color:#c2410c;border-radius:999px;padding:3px 12px;font-weight:800;font-size:13px}.cap-warn{background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;border-radius:14px;padding:10px 14px;font-weight:700;text-align:center;margin:14px 0 0;font-size:14px}.cap-err-banner{background:#fee2e2;border-color:#fecaca;color:#991b1b;word-break:break-word}.cap-field{display:grid;gap:8px;font-weight:800;color:#344054;margin:18px 0 0}.cap-field select,.cap-field input{border:1px solid #d0d5dd;border-radius:14px;padding:15px;font-size:16px;background:white;color:#14213d;width:100%}.cap-correct{display:grid;gap:12px;border-top:1px solid #eef2f6;margin-top:16px;padding-top:16px}.cap-correct label{display:grid;gap:6px;font-weight:700;color:#344054;font-size:14px}.cap-correct input,.cap-correct select{border:1px solid #d0d5dd;border-radius:12px;padding:12px;font-size:16px;width:100%}.cap-two{display:grid;grid-template-columns:1fr 1fr;gap:12px}.cap-validate{width:100%;border:0;background:#16a34a;color:white;border-radius:16px;padding:17px;font-size:18px;font-weight:900;cursor:pointer;margin-top:18px}.cap-validate:disabled{opacity:.6;cursor:wait}.cap-btns{display:grid;gap:10px;width:100%;margin-top:8px}.cap-links{display:flex;justify-content:center;gap:22px;margin-top:14px}.cap-link{border:0;background:transparent;color:#667085;font-weight:800;cursor:pointer;text-decoration:underline}@media(max-width:1050px){.stats,.columns,.grid{grid-template-columns:1fr}.sidebar{width:230px}.row{grid-template-columns:1fr}.head{display:none}}@media(max-width:780px){.app{flex-direction:column}.sidebar{width:100%}.sidebar nav{grid-template-columns:repeat(2,1fr)}.content{padding:20px}.topbar{padding:14px 20px;align-items:flex-start;flex-direction:column}.topbar-actions{width:100%;justify-content:space-between;flex-wrap:wrap}.hero{align-items:flex-start;flex-direction:column}.right,.doc-item{flex-direction:column}.doc-actions{align-items:flex-start;justify-content:flex-start}.right button{width:100%}.two-cols{grid-template-columns:1fr}.ai-extract{grid-template-columns:repeat(2,1fr)}}
 `;
